@@ -1,0 +1,13 @@
+migration-plan*.json
+migration-plan*.csv
+*-plan.json
+*-plan.csv
+*-plan.sources.csv
+*-plan.findings.csv
+*journal*.jsonl
+*.lock
+.env
+credentials*.json
+client_secret*.json
+.secrets/
+token*.json
