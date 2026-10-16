@@ -30,23 +30,8 @@ if ($Mode -eq 'Plan') {
         ($MigrationReport -and (Test-Path -LiteralPath $findingsPath))) { throw 'Plan/report already exists. Choose a new PlanPath; keep old plans with their journals.' }
     $planOptions = @{ RootId = $RootId; DestinationUrl = $DestinationUrl; MaxPathLength = $MaxPathLength; MaxNameLength = $MaxNameLength }
     if ($MigrationReport) {
-        # Migration Manager's ProjectError CSV; FullPath is relative to the reported source root.
-        $failures = @(foreach ($file in $MigrationReport) {
-            $file = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($file)
-            if ((Get-Content -LiteralPath $file -TotalCount 1) -notmatch '(^|,)"?FullPath"?(,|$)') {
-                throw "$file has no FullPath column. Use the Migration Manager error report (ProjectError.csv), not MigrationSummary.csv."
-            }
-            Import-Csv -LiteralPath $file
-        })
         $source = if ($ReportSourcePath) { $ReportSourcePath } else { $MigrationSourcePath }
-        if (!$source) {
-            $sources = @($failures | ForEach-Object SourcePath | Sort-Object -Unique)
-            if ($sources.Count -gt 1) { throw 'The report covers several sources; pass -ReportSourcePath.' }
-            $source = $sources | Select-Object -First 1
-        }
-        $matched = @($failures | Where-Object SourcePath -eq $source)
-        if ($failures.Count -and !$matched.Count) { throw "No report rows for source '$source'. Check -ReportSourcePath." }
-        $planOptions.ReportFailures = $matched
+        $planOptions.ReportFailures = @(Import-MigrationReport -Path $MigrationReport -SourcePath $source)
     }
     $items = @(Get-DriveInventory -RootId $RootId)
     $plan = New-DriveRenamePlan -Items $items @planOptions

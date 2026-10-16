@@ -22,11 +22,14 @@ shares and on-premises SharePoint, not Google Drive. This project does not inven
 a Google `Add-SPMTTask` command or call private Microsoft endpoints. It automates
 Google inventory, naming plans, approved renames, and recovery. It can generate a
 supported Migration Manager source CSV, but creating/starting the Google migration
-still uses Microsoft's admin interface. No files are transferred by these scripts.
+still uses Microsoft's admin interface. The one exception is `Copy-LargeDriveFiles.ps1`
+(section 4): it moves only the individual files Migration Manager could not copy,
+such as Google-native files over the export limit, into their original folders.
 
 ## Requirements
 
-- PowerShell 7.2 or newer (`pwsh`), with no additional PowerShell modules.
+- PowerShell 7.2 or newer (`pwsh`), with no additional PowerShell modules. Only
+  the large-file Upload (section 4) needs PnP.PowerShell and PowerShell 7.4+.
 - Google Workspace with the Drive API enabled in an approved Google Cloud project.
 - An OAuth access token for an account that can access **all** content in the
   selected tree. Workspace admin status alone does not give access to everyone's
@@ -58,6 +61,14 @@ send credentials or tokens through chat. Tokens are short-lived; refresh the
 environment variable and rerun with the **same plan and journal** if one expires.
 The scripts do not store tokens or refresh credentials. The token is available
 to the current process and child processes until removed.
+
+**Google usage limits.** Drive API quotas are 1,000,000 units per minute per project
+and 325,000 per minute per user. A read costs 5 units, a list 100, a download 200,
+and an edit 50. The scripts make one request at a time, far below these quotas.
+Quota errors (`403 User rate limit exceeded`, `429`) and 5xx responses are retried
+with Google's recommended backoff: `2^n` seconds plus up to 1 s of random delay,
+capped at 64 s, for up to 8 attempts. Projects that used the API between
+November 2025 and April 2026 keep their earlier quotas.
 
 Use the actual folder ID from `https://drive.google.com/drive/folders/FOLDER_ID`.
 For the My Drive root, resolve the `root` alias first:
@@ -239,6 +250,269 @@ Clear the token after the operation:
 Remove-Item Env:\GDRIVE_ACCESS_TOKEN
 ```
 
+## 4. Large Files Migration Manager Could Not Copy
+
+### Guided Run for End Users
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File .\Start-FailedFileTransfer.ps1
+```
+
+One script does the whole repair and asks only for what it cannot find:
+
+1. The Migration Manager error report (`ProjectError.csv`, its folder, or the
+   downloaded .zip), and which source in it to fix.
+2. The SharePoint folder that source was migrated into (browser address or a
+   **Copy link** sharing link; the script resolves it).
+3. The Google OAuth client JSON and the Entra app (client) ID. Type `setup` at
+   either prompt and the script writes a copy-pastable setup script for an admin
+   (`setup-google-oauth.ps1` or `setup-entra-app.ps1`) and stops.
+4. Microsoft and Google sign-ins in the browser. The Google folder is found from
+   the report's source path (`/Shared drive` or `user@domain/folder`).
+5. It then captures metadata, downloads the failed files (listing any it cannot,
+   with links, for a manual download), previews and uploads them, and offers to
+   apply sharing (identity map CSV, or a domain-to-domain mapping it creates).
+
+Every step asks before changing SharePoint and writes its run report. The run ends
+with `failed-files-summary.csv`: one row per report failure with its Google
+source, SharePoint destination, `Success`/`Failure`, and reason. Folders that failed
+(for example path too long) are listed as needing the rename steps instead. Work
+files go to `Documents\DriveMigration\<source>`; running again for the same source
+offers to continue, skipping finished files.
+
+**With Claude Code:** type `/start-transfer` (optionally followed by the report path)
+in Claude Code at the repository root. The skill asks the same questions in the chat,
+runs the script unattended (`-NonInteractive`), shows the preview, and uploads or
+applies sharing only after you say yes. `.claude/settings.json` pre-approves exactly
+`pwsh -NoProfile -File .\Start-FailedFileTransfer.ps1 …` and makes rename
+Apply/Rollback always ask. Browser sign-ins still need you.
+
+**Unattended parameters.** Every question has a parameter: `-ReportPath`,
+`-SourcePath`, `-DestinationLink`, `-GoogleClientSecretPath`, `-EntraClientId`
+(`setup` writes the admin script), `-SourceFolderId`, `-IdentityMapPath` or
+`-GoogleDomain`/`-MicrosoftDomain`, plus `-SaveSettings`, `-NewRun`. With
+`-NonInteractive` a missing answer stops the run, and SharePoint changes need
+`-Upload`, `-CreateMissingFolders`, `-ApplySharing`, `-ImportManualDownloads`;
+without them the run stops after the upload preview. Exit code 1 means it stopped
+early; run again to continue.
+
+**Where the app details are stored.** Both live in the `.secrets` folder next to
+the scripts (git-ignored):
+
+```text
+.secrets\
+  client_secret_....json      Google OAuth client (Desktop app) downloaded from Google Cloud
+  migration-settings.json     the Entra app (client) ID
+```
+
+```json
+{ "EntraClientId": "00000000-0000-0000-0000-000000000000", "GoogleClientSecretPath": "" }
+```
+
+You don't have to create these by hand. When the wizard asks for the JSON and the
+client ID, paste them; it then offers to **save them in `.secrets`** (creating the
+folder) and to **copy the Google JSON there**. Next time it asks nothing. Leave
+`GoogleClientSecretPath` empty when exactly one `client_secret*.json` is in `.secrets`:
+it is found automatically, so the folder works on any computer. The wizard only
+stores a full path when the JSON is kept somewhere else.
+
+**Recommended setup: once per organisation, not per user.** An admin runs the two
+`setup` scripts once, puts the Google JSON and `migration-settings.json` in `.secrets`,
+and shares the scripts folder through a protected team location (not the public
+repository). Neither value is a password (Microsoft treats client IDs as public;
+Google treats desktop clients as unable to keep a secret). End users then only answer
+the report and destination questions. The Google client's consent screen and Desktop client cannot be created
+from the command line; the setup script covers the command-line part (project and
+Drive API) and lists the console steps.
+
+### Individual Steps
+
+Google's API export (`files.export`) stops at 10 MB, so very large Docs, Sheets,
+and Slides can fail to convert. `Copy-LargeDriveFiles.ps1` rebuilds those files
+into their original SharePoint folders after the main migration. It uses the plan
+for the migrated root: each row's `TargetPath` is the original folder and name.
+
+1. **Download** the selected items from Google into a local staging folder that
+   mirrors the destination. Google-native files are exported to Office/PNG. When
+   `files.export` refuses a file, the script tries that file's `exportLinks` URL.
+   Google does not document whether that URL accepts larger files, so check the
+   run report. Anything still failing is marked `ManualDownload`.
+2. **Import** files you downloaded by hand (in the Google editor, **File >
+   Download**) from an inbox folder. Names are matched to plan items, including
+   the `_` replacements and ` (1)` suffixes browsers add. Unclear matches are
+   reported instead of guessed; the run report shows the exact staging path, so
+   you can copy those files into place yourself.
+3. **Upload** the staging folder to SharePoint with PnP.PowerShell.
+
+```powershell
+# Download: needs a token with https://www.googleapis.com/auth/drive.readonly.
+.\Get-GoogleToken.ps1 -Scope 'https://www.googleapis.com/auth/drive.readonly'
+.\Copy-LargeDriveFiles.ps1 -Mode Download -PlanPath .\finance-plan.json `
+    -StagingPath D:\stage\finance -MigrationReport .\ProjectError.csv
+
+# Import manual downloads (all plan files are candidates unless -Id/-MigrationReport is given).
+.\Copy-LargeDriveFiles.ps1 -Mode Import -PlanPath .\finance-plan.json `
+    -StagingPath D:\stage\finance -InboxPath "$HOME\Downloads\finance-large"
+
+# Upload: preview, then upload with a confirmation prompt.
+Connect-PnPOnline -Url https://contoso.sharepoint.com/sites/IT -ClientId 'YOUR_ENTRA_APP_ID' -Interactive
+.\Copy-LargeDriveFiles.ps1 -Mode Upload -PlanPath .\finance-plan.json -StagingPath D:\stage\finance `
+    -JournalPath .\finance-upload-journal.jsonl -ApproveUpload -WhatIf
+.\Copy-LargeDriveFiles.ps1 -Mode Upload -PlanPath .\finance-plan.json -StagingPath D:\stage\finance `
+    -JournalPath .\finance-upload-journal.jsonl -ApproveUpload
+```
+
+Select items with `-Id` (Google file IDs) or `-MigrationReport` (the failed rows of
+`ProjectError.csv`; add `-ReportSourcePath` if it covers several sources).
+Download never fetches a whole tree. It stops at Google's egress limit of
+**1 TB per project per day** (`-MaxDownloadBytes`, default 10^12 bytes). Remaining
+items are marked `Deferred`; rerun after 24 hours and already-staged files are skipped.
+The budget counts only this run, so lower it if other jobs use the same Google Cloud
+project.
+
+**Run report.** Every run (all five modes) writes `large-files-<mode>-<time>.csv`
+(`-StatusPath` overrides the name; existing files are never overwritten), one row
+per item:
+
+| Column | Content |
+| --- | --- |
+| `RunUtc`, `Step` | When the run started and which mode ran |
+| `Source` | `Google Drive: /folder/name (ID …)`, or `Local file: …` for unmatched manual downloads |
+| `Destination` | Full SharePoint URL of the file or folder |
+| `Result` | `Success` or `Failure` |
+| `Reason` | Why: e.g. `Downloaded from Google (ExportLink)`, `Uploaded to SharePoint`, `Dates, people, and sharing applied; shared with …`, or the failure cause |
+| `Status`, `LocalPath` | Detailed status code and staging file, for troubleshooting |
+
+`Already…` results count as `Success` (done in an earlier run). If a run stops
+partway (for example a lost connection), the report is still written with the
+items handled so far and a final `Failure` row giving the reason it stopped. `-WhatIf`
+previews write no report. Review every `Failure` row.
+
+**Which plan.** Use the plan whose names match what was migrated. If you applied
+renames, use that plan. If you migrated without renames, create a report-targeted plan
+(it keeps names verbatim). Download checks that each item's current Google name
+equals the plan's `NewName`. Rows whose target name contains characters SharePoint
+rejects (Migration Manager replaced them during the copy, using its own settings)
+and rows where Migration Manager chose which collision got a `(1)` suffix are
+reported for manual handling, not guessed.
+
+**SharePoint upload limits handled by the script:**
+
+- Files over **250 GB** are refused (SharePoint's per-file limit).
+- Target paths over **400** decoded characters, invalid characters, and reserved
+  names are refused.
+- `Add-PnPFile` uploads files over 10 MB in 10 MB chunks, so large files are not
+  limited by the single-request size.
+- `Add-PnPFile` silently **overwrites** existing files and **creates** missing
+  folders. The script checks first: it never uploads over an existing file
+  (`Exists`), and skips files whose folder is missing (`FolderMissing`), because
+  that usually means Migration Manager put the folder under a different name.
+  Pass `-CreateMissingFolders` only once you've confirmed the folder really is
+  absent; the script then creates it with `Resolve-PnPFolder` (in the live pilot,
+  `Add-PnPFile` 3.4.1 failed with NotFound instead of creating it). A check-then-upload race remains, so keep the destination frozen.
+- Every uploaded file is checked by size afterwards. A JSONL journal records
+  intent and completion. Rerun with the same plan and journal to resume. A file
+  left half-uploaded by an interrupted run is reported as `PartialUpload` for
+  manual cleanup, never overwritten.
+- Staging files that map to no plan item stop the upload before anything is sent.
+- Tenant blocked file types and storage quota are not checked; they appear as
+  upload errors.
+
+**Not carried over by Upload:** sharing, author, and dates. The uploaded file shows
+the uploading account and the upload time until you reapply metadata (below).
+Version history is never carried over.
+
+### Reapply Dates, People, and Sharing
+
+Capture Google's metadata **at the same time as the download** (keep the tree frozen),
+then apply it after the upload:
+
+```powershell
+# Read-only: dates, owner, last editor, and sharing for every item in the plan tree.
+.\Copy-LargeDriveFiles.ps1 -Mode Metadata -PlanPath .\finance-plan.json
+# -> finance-plan.metadata.json and finance-plan.permissions.csv (review the CSV)
+
+# After Upload, with the same PnP connection: preview, then apply.
+.\Copy-LargeDriveFiles.ps1 -Mode ApplyMetadata -PlanPath .\finance-plan.json `
+    -IdentityMapPath .\identity-map.csv -JournalPath .\finance-upload-journal.jsonl `
+    -MetadataJournalPath .\finance-metadata-journal.jsonl -ApproveMetadata -WhatIf
+```
+
+The identity map is a CSV you write, mapping Google accounts to Microsoft 365
+sign-in names. A row starting with `@` maps a whole domain; explicit rows win:
+
+```csv
+GoogleIdentity,Microsoft365Identity
+jane.doe@example-google.com,jdoe@contoso.com
+@example-google.com,@contoso.com
+```
+
+What Apply does, for each file in the **upload journal** plus the folders above it
+(`-SkipFolders` limits it to files):
+
+- **Dates and people.** Tries to set Created, Modified, Author (Google owner), and
+  Modified By (Google last editor) with `UpdateOverwriteVersion`. **In the live pilot
+  (Member account, `AllSites.Write`) SharePoint accepted the call but kept its own
+  values**; the REST `ValidateUpdateListItem` route behaved the same. Overriding
+  these system fields needs more than Edit rights. The script reads the dates back
+  and reports `PartlyApplied` when they were ignored; the Google values stay in the
+  metadata file. People need a mapping; unmapped people are reported.
+- **Sharing.** Grants only sharing set **directly** on that item in Google. Inherited
+  sharing comes from the folder above, which gets its own direct grants. Folders are
+  processed first. Access is granted with Microsoft Graph's sharing invite, as
+  SharePoint's **Share** dialog does: Google reader/commenter become `read`;
+  writer and organizer become `write`. The Google owner becomes the Author, not a
+  sharing grant (Google lists every My Drive item's owner as a direct permission). People must sign in, no invitation
+  email is sent, and existing (inherited) access is kept. Grants are only ever added.
+  In SharePoint they appear as sharing on the item ("Shared with").
+- **Reported, not applied:** domain-wide and "anyone with the link" sharing (no
+  direct equivalent), deleted accounts, unmapped people, items whose Google
+  permission list was unreadable (the account could not share them), and sharing on
+  the source root or shared-drive membership. Grant those at the library, folder, or
+  site membership yourself.
+- A journal makes reruns skip finished items. More than 5,000 items needing unique
+  permissions triggers a warning; Microsoft recommends no more than that per library.
+
+The Microsoft 365 accounts must already exist (create guests for external people
+first). Google groups need a mail-enabled Microsoft 365 or security group; whether
+SharePoint resolves a group's email directly should be checked in the pilot. Setting
+Created/Author through PnP is commonly used but not covered by PnP's documentation;
+also confirm it in the pilot. Sharing changes made in Google after the capture are
+not picked up: capture again with a new `-MetadataPath`.
+
+**PnP.PowerShell requirements:** `Install-Module PnP.PowerShell -Scope CurrentUser`.
+Version 3.x requires PowerShell 7.4 or later and your own Entra ID app registration.
+PnP is only needed for Upload and ApplyMetadata; the other modes and the tests run
+without it. Connect to the site (or subsite) that contains the destination library.
+
+**Minimum Entra app permissions (all delegated; no Full Control):**
+
+| API | Permission | Used for |
+| --- | --- | --- |
+| SharePoint | `AllSites.Write` | Upload; Created/Modified/Author/Editor |
+| Microsoft Graph | `Files.ReadWrite.All` | Sharing invites in ApplyMetadata |
+| Microsoft Graph | `User.Read` | Sign-in |
+
+Delegated permissions never exceed the signed-in account. Run as a dedicated
+migration account that is a **Member (Edit)** of the destination sites, not an
+Owner. The sites' sharing settings must let members share, and external sharing must
+be allowed for people outside the organization. The app needs the platform *Mobile
+and desktop applications* with redirect URI `http://localhost`, and admin consent:
+
+```powershell
+Register-PnPEntraIDAppForInteractiveLogin -ApplicationName 'Drive Migration' -Tenant contoso.onmicrosoft.com `
+    -SharePointDelegatePermissions 'AllSites.Write' -GraphDelegatePermissions 'Files.ReadWrite.All', 'User.Read'
+Connect-PnPOnline -Url https://contoso.sharepoint.com/sites/IT -ClientId 'APP_CLIENT_ID' -Interactive
+```
+
+With these permissions, uploads and sharing worked in the live pilot, but original
+Created/Modified/Author/Editor values could not be applied (see above).
+
+Keep the staging folder outside this repository on an encrypted, access-controlled
+disk with enough free space, and delete it after sign-off. It holds full file
+content. Use a short staging path; Windows handles long paths in PowerShell 7, but
+other tools may not.
+
 ## Offline Tests
 
 ```powershell
@@ -248,7 +522,8 @@ pwsh -NoProfile -File .\Test-DriveMigration.ps1
 Tests use synthetic metadata and mocked Google calls. They cover naming and path
 budgets, conversion collisions, Unicode truncation, pagination, shared-drive
 queries, incomplete inventories, dry runs, resume, lost-response recovery,
-rollback, and drift rejection. They do not validate a real Google account,
+rollback, drift rejection, and the large-file download/import/upload flow with
+mocked Google and PnP calls. They do not validate a real Google account,
 SharePoint destination, Microsoft migration, conversion fidelity, or permission
 mapping. A live pilot is required before production use.
 
@@ -285,3 +560,8 @@ test names and paths only. If the run stops partway, empty the drives and rerun.
 - [SharePoint naming restrictions](https://support.microsoft.com/en-us/office/restrictions-and-limitations-in-onedrive-and-sharepoint-64883a5d-228e-48f5-b3d2-eb39e07630fa)
 - [Google Drive file listing](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/list)
 - [Google Drive metadata updates and OAuth scopes](https://developers.google.com/workspace/drive/api/reference/rest/v3/files/update)
+- [Google Drive API usage limits](https://developers.google.com/workspace/drive/api/guides/limits)
+- [Google Drive downloads and the 10 MB export limit](https://developers.google.com/workspace/drive/api/guides/manage-downloads)
+- [PnP.PowerShell Add-PnPFile](https://pnp.github.io/powershell/cmdlets/Add-PnPFile.html) and [Entra app registration](https://pnp.github.io/powershell/articles/registerapplication.html)
+- [Set-PnPListItem](https://pnp.github.io/powershell/cmdlets/Set-PnPListItem.html) and [Graph driveItem invite](https://learn.microsoft.com/en-us/graph/api/driveitem-invite)
+- [Google Drive permissions resource](https://developers.google.com/workspace/drive/api/reference/rest/v3/permissions)

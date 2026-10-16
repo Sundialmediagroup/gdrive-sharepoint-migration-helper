@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(pwsh -NoProfile -File .\\Start-FailedFileTransfer.ps1 *)"
+    ],
+    "ask": [
+      "PowerShell(*Prepare-DriveMigration.ps1*-Mode Apply*)",
+      "PowerShell(*Prepare-DriveMigration.ps1*-Mode Rollback*)",
+      "Bash(*Prepare-DriveMigration.ps1*-Mode Apply*)",
+      "Bash(*Prepare-DriveMigration.ps1*-Mode Rollback*)"
+    ]
+  }
+}

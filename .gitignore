@@ -11,3 +11,7 @@ credentials*.json
 client_secret*.json
 .secrets/
 token*.json
+large-files-*.csv
+*.metadata.json
+*.permissions.csv
+identity-map*.csv
